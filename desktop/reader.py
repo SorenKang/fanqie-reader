@@ -23,6 +23,18 @@ import traceback
 import tkinter as tk
 from tkinter import filedialog, font as tkfont, ttk
 
+try:                                    # 仅 Windows 用得上，别的平台自动降级
+    import ctypes
+    from ctypes import wintypes as _wt
+    _user32 = ctypes.WinDLL('user32', use_last_error=True)
+    _gdi32 = ctypes.WinDLL('gdi32', use_last_error=True)
+    _gdi32.GetPixel.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+    _gdi32.GetPixel.restype = ctypes.c_uint32
+    _user32.GetDC.restype = ctypes.c_void_p
+except Exception:                       # pragma: no cover
+    ctypes = None
+    _user32 = _gdi32 = None
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, ROOT)
@@ -53,8 +65,41 @@ THEMES = {
         'acc': '#3f9d82', 'acc_fg': '#ffffff', 'acc_hover': '#357f6a',
     },
 }
-THEME_ORDER = ['light', 'sepia', 'dark']
-THEME_NAME = {'light': '浅色', 'sepia': '护眼', 'dark': '深色'}
+THEME_ORDER = ['light', 'sepia', 'dark', 'auto']
+THEME_NAME = {'light': '浅色', 'sepia': '护眼', 'dark': '深色', 'auto': '跟随'}
+
+
+# ---------------------------------------------------------------- 颜色小工具
+def _hex(rgb):
+    return '#%02x%02x%02x' % tuple(max(0, min(255, int(round(v)))) for v in rgb)
+
+
+def _rgb(h):
+    h = h.lstrip('#')
+    return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def _mix(c, target, k):
+    """c 与 target 按 k 混合，k=0 得到 c，k=1 得到 target。"""
+    return tuple(a * (1.0 - k) + b * k for a, b in zip(c, target))
+
+
+def _desat(c, k=0.5):
+    """按 k 往灰里拉，避免壁纸太艳时背景发荧光。"""
+    g = 0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2]
+    return tuple(v * (1.0 - k) + g * k for v in c)
+
+
+def _luma(c):
+    return (0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2]) / 255.0
+
+
+if _user32 is not None:
+    class _RECT(ctypes.Structure):
+        _fields_ = [('left', ctypes.c_long), ('top', ctypes.c_long),
+                    ('right', ctypes.c_long), ('bottom', ctypes.c_long)]
+else:                                   # pragma: no cover
+    _RECT = None
 
 
 class FlatButton(tk.Label):
@@ -158,6 +203,8 @@ class Reader:
         self.state = {}
         self._pad = 40
         self._ticks = 0
+        self._cur = dict(THEMES['light'])
+        self._last_env = None
         self.source = TomatoSource()
         self._src_dlg = None
 
@@ -177,7 +224,7 @@ class Reader:
             self.state = {}
         self.fs = int(self.state.get('fs', 18))
         self.theme = self.state.get('theme', 'light')
-        if self.theme not in THEMES:
+        if self.theme not in THEMES and self.theme != 'auto':
             self.theme = 'light'
         self.speed = int(self.state.get('speed', 8))
         self.toc_on = bool(self.state.get('toc', True))
@@ -325,7 +372,10 @@ class Reader:
 
     def _restore_geom(self):
         g = self.state.get('geom', '')
-        sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        sw = self.root.winfo_screenwidth()
+        sh = self.root.winfo_screenheight()
+        if sw < 640 or sh < 480:            # 窗口还没初始化时可能拿到 1，兜底
+            sw, sh = 1920, 1080
         ok = False
         m = re.match(r'^(\d+)x(\d+)', g or '')
         if m:
@@ -339,13 +389,107 @@ class Reader:
         self.apply_geom()
 
     def apply_geom(self):
-        """窗口首次 map 之前设的 geometry 会被内容尺寸盖掉，map 后再钉一次。"""
+        """窗口首次 map 之前设的 geometry 会被内容尺寸盖掉，map 后连设几次钉住。"""
         self.root.geometry(self._geom)
-        self.root.after(30, lambda: self.root.geometry(self._geom))
+        for delay in (40, 160, 400):
+            self.root.after(delay, lambda: self.root.geometry(self._geom))
+
+    # ------------------------------------------------------------------ 取色
+    def sample_env_color(self, ring=8):
+        """取窗口四周一圈的屏幕平均色，当作环境色。取不到返回 None。"""
+        if _user32 is None or _RECT is None:
+            return None
+        try:
+            hwnd = _user32.GetParent(self.root.winfo_id())
+            rc = _RECT()
+            if not _user32.GetWindowRect(hwnd, ctypes.byref(rc)):
+                return None
+            scale = self.root.winfo_fpixels('1i') / 96.0   # tk 用逻辑像素，GDI 用物理像素
+            left, top = int(rc.left * scale), int(rc.top * scale)
+            right, bottom = int(rc.right * scale), int(rc.bottom * scale)
+            w, h = max(1, right - left), max(1, bottom - top)
+
+            pts = []
+            for i in range(13):
+                x = left + w * i // 12
+                pts.append((x, top - ring))
+                pts.append((x, bottom + ring))
+            for i in range(11):
+                y = top + h * i // 10
+                pts.append((left - ring, y))
+                pts.append((right + ring, y))
+
+            hdc = _user32.GetDC(None)
+            if not hdc:
+                return None
+            acc = [0.0, 0.0, 0.0]
+            n = 0
+            try:
+                for x, y in pts:
+                    if x < 0 or y < 0:
+                        continue
+                    c = _gdi32.GetPixel(hdc, int(x), int(y))
+                    if c == 0xFFFFFFFF:            # CLR_INVALID
+                        continue
+                    acc[0] += c & 0xFF
+                    acc[1] += (c >> 8) & 0xFF
+                    acc[2] += (c >> 16) & 0xFF
+                    n += 1
+            finally:
+                _user32.ReleaseDC(None, hdc)
+            if not n:
+                return None
+            return tuple(v / n for v in acc)
+        except Exception:
+            return None
+
+    def _auto_theme(self):
+        """由环境色推一套阅读配色：环境亮就用米白底，环境暗就用墨黑底。"""
+        env = self.sample_env_color()
+        if env is not None:
+            self._last_env = env
+        else:
+            env = self._last_env            # 取不到就沿用上次，别来回跳
+        if env is None:
+            return dict(THEMES['light'])
+        env = _desat(env, 0.50)                 # 压掉壁纸的艳度，只留一点色相
+
+        if _luma(env) > 0.5:                    # 亮环境 → 深色字
+            return {
+                'bg':    _hex(_mix(env, (255, 255, 255), 0.85)),
+                'panel': _hex(_mix(env, (255, 255, 255), 0.77)),
+                'hover': _hex(_mix(env, (255, 255, 255), 0.68)),
+                'line':  _hex(_mix(env, (255, 255, 255), 0.58)),
+                'fg': '#232327', 'sub': '#8b8b86',
+                'sel': _hex(_mix((96, 156, 130), (255, 255, 255), 0.55)),
+                'sel_fg': '#12523d',
+                'acc': '#0f6f56', 'acc_fg': '#ffffff', 'acc_hover': '#0b5a45',
+            }
+        return {                                # 暗环境 → 浅色字
+            'bg':    _hex(_mix(env, (0, 0, 0), 0.84)),
+            'panel': _hex(_mix(env, (0, 0, 0), 0.76)),
+            'hover': _hex(_mix(env, (0, 0, 0), 0.66)),
+            'line':  _hex(_mix(env, (0, 0, 0), 0.56)),
+            'fg': '#d4d4d6', 'sub': '#7d7d80',
+            'sel': _hex(_mix((64, 132, 106), (0, 0, 0), 0.40)),
+            'sel_fg': '#d9f0e6',
+            'acc': '#3f9d82', 'acc_fg': '#ffffff', 'acc_hover': '#357f6a',
+        }
+
+    def _auto_refresh(self):
+        """环境色变了才重绘，避免每轮都刷新造成闪烁。"""
+        env = self.sample_env_color()
+        if env is None:
+            return
+        prev = self._last_env
+        if prev and max(abs(a - b) for a, b in zip(env, prev)) < 6:
+            return
+        self._apply_theme()
 
     # ------------------------------------------------------------------ 配色
     def _apply_theme(self):
-        t = THEMES[self.theme]
+        t = self._auto_theme() if self.theme == 'auto' else dict(THEMES[self.theme])
+        self._cur = t
         self.root.configure(bg=t['bg'])
 
         self.bar.configure(bg=t['panel'])
@@ -376,7 +520,7 @@ class Reader:
 
         self._tags()
         self.btn_theme.set_text(THEME_NAME[self.theme])
-        self._dark_titlebar(self.theme == 'dark')
+        self._dark_titlebar(_luma(_rgb(t['bg'])) < 0.5)
 
     def _dark_titlebar(self, dark: bool):
         """Windows 10/11：让标题栏跟随深色配色。"""
@@ -397,15 +541,16 @@ class Reader:
             'h', lmargin1=0, lmargin2=0, rmargin=0,
             spacing1=int(fs * 1.5), spacing2=int(fs * 0.35), spacing3=int(fs * 0.9),
             font=self.f_head)
-        self.txt.tag_configure('link', foreground=THEMES[self.theme]['acc'],
-                               underline=True)
-        self.txt.tag_configure('dim', foreground=THEMES[self.theme]['sub'])
+        self.txt.tag_configure('link', foreground=self._cur['acc'], underline=True)
+        self.txt.tag_configure('dim', foreground=self._cur['sub'])
 
     def cycle_theme(self):
         self.theme = THEME_ORDER[(THEME_ORDER.index(self.theme) + 1) % len(THEME_ORDER)]
         self._apply_theme()
         self.render(keep_ratio=True)
         self.flash('配色 · ' + THEME_NAME[self.theme])
+        if self.theme == 'auto':
+            self.flash('配色 · 跟随环境，挪动窗口会重新取色')
 
     def set_fs(self, d):
         self.fs = max(14, min(36, self.fs + d))
@@ -629,6 +774,8 @@ class Reader:
                         self.auto = False
                         self.btn_auto.set_text('自动滚动')
         self._ticks += 1
+        if self.theme == 'auto' and self._ticks % 50 == 0:
+            self._auto_refresh()
         if self._ticks % 100 == 0:      # 每 5 秒落一次盘
             self.save_progress()
             self.save_state()
