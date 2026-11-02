@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 运行时数据
+desktop/state.json
+desktop/error.log
+vendor/*.exe
+vendor/tomato-rust
+vendor/data/
+vendor/app.js
+
+# 书库：小说原文不进仓库
+books/*
+!books/.gitkeep
+legacy/web/cache/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+.DS_Store
