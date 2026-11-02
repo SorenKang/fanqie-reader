@@ -28,9 +28,24 @@ try:                                    # 仅 Windows 用得上，别的平台�
     from ctypes import wintypes as _wt
     _user32 = ctypes.WinDLL('user32', use_last_error=True)
     _gdi32 = ctypes.WinDLL('gdi32', use_last_error=True)
+    _user32.GetDC.restype = ctypes.c_void_p
+    _user32.GetDC.argtypes = [ctypes.c_void_p]
+    _user32.ReleaseDC.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
     _gdi32.GetPixel.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
     _gdi32.GetPixel.restype = ctypes.c_uint32
-    _user32.GetDC.restype = ctypes.c_void_p
+    _gdi32.CreateCompatibleDC.restype = ctypes.c_void_p
+    _gdi32.CreateCompatibleDC.argtypes = [ctypes.c_void_p]
+    _gdi32.CreateCompatibleBitmap.restype = ctypes.c_void_p
+    _gdi32.CreateCompatibleBitmap.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+    _gdi32.SelectObject.restype = ctypes.c_void_p
+    _gdi32.SelectObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    _gdi32.BitBlt.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                              ctypes.c_int, ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
+                              ctypes.c_uint32]
+    _gdi32.GetDIBits.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint,
+                                 ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint]
+    _gdi32.DeleteObject.argtypes = [ctypes.c_void_p]
+    _gdi32.DeleteDC.argtypes = [ctypes.c_void_p]
 except Exception:                       # pragma: no cover
     ctypes = None
     _user32 = _gdi32 = None
@@ -98,8 +113,55 @@ if _user32 is not None:
     class _RECT(ctypes.Structure):
         _fields_ = [('left', ctypes.c_long), ('top', ctypes.c_long),
                     ('right', ctypes.c_long), ('bottom', ctypes.c_long)]
+
+    class _BITMAPINFOHEADER(ctypes.Structure):
+        _fields_ = [('biSize', ctypes.c_uint32), ('biWidth', ctypes.c_int32),
+                    ('biHeight', ctypes.c_int32), ('biPlanes', ctypes.c_uint16),
+                    ('biBitCount', ctypes.c_uint16), ('biCompression', ctypes.c_uint32),
+                    ('biSizeImage', ctypes.c_uint32), ('biXPelsPerMeter', ctypes.c_int32),
+                    ('biYPelsPerMeter', ctypes.c_int32), ('biClrUsed', ctypes.c_uint32),
+                    ('biClrImportant', ctypes.c_uint32)]
+
+    class _BITMAPINFO(ctypes.Structure):
+        _fields_ = [('bmiHeader', _BITMAPINFOHEADER), ('bmiColors', ctypes.c_uint32 * 3)]
+
+    _SRCCOPY = 0x00CC0020
+
+    def _grab_line(x0, y0, length, vertical=False):
+        """抓屏幕上一行或一列像素。BitBlt 一次搬完，比逐点 GetPixel 快两个数量级。"""
+        length = int(length)
+        if length <= 0:
+            return None
+        w, h = (1, length) if vertical else (length, 1)
+        screen = _user32.GetDC(None)
+        if not screen:
+            return None
+        mem = _gdi32.CreateCompatibleDC(screen)
+        bmp = _gdi32.CreateCompatibleBitmap(screen, w, h)
+        old = _gdi32.SelectObject(mem, bmp)
+        try:
+            if not _gdi32.BitBlt(mem, 0, 0, w, h, screen, int(x0), int(y0), _SRCCOPY):
+                return None
+            bi = _BITMAPINFO()
+            bi.bmiHeader.biSize = ctypes.sizeof(_BITMAPINFOHEADER)
+            bi.bmiHeader.biWidth = w
+            bi.bmiHeader.biHeight = -h          # 负数表示自上而下
+            bi.bmiHeader.biPlanes = 1
+            bi.bmiHeader.biBitCount = 32
+            bi.bmiHeader.biCompression = 0      # BI_RGB
+            buf = ctypes.create_string_buffer(w * h * 4)
+            if not _gdi32.GetDIBits(mem, bmp, 0, h, buf, ctypes.byref(bi), 0):
+                return None
+            raw = buf.raw
+            return [(raw[i + 2], raw[i + 1], raw[i]) for i in range(0, len(raw), 4)]
+        finally:
+            _gdi32.SelectObject(mem, old)
+            _gdi32.DeleteObject(bmp)
+            _gdi32.DeleteDC(mem)
+            _user32.ReleaseDC(None, screen)
 else:                                   # pragma: no cover
     _RECT = None
+    _grab_line = None
 
 
 class FlatButton(tk.Label):
@@ -205,6 +267,9 @@ class Reader:
         self._ticks = 0
         self._cur = dict(THEMES['light'])
         self._last_env = None
+        self._conf_job = None
+        self._alpha_now = 1.0
+        self._dark_now = None
         self.source = TomatoSource()
         self._src_dlg = None
 
@@ -214,6 +279,9 @@ class Reader:
         self._bind()
         self._open_last()
         self._tick()
+
+        if self.theme == 'auto':        # 窗口 map 之后才取得到真实环境色
+            self.root.after(500, self._auto_refresh)
 
     # ------------------------------------------------------------------ 状态
     def _load_state(self):
@@ -395,51 +463,47 @@ class Reader:
             self.root.after(delay, lambda: self.root.geometry(self._geom))
 
     # ------------------------------------------------------------------ 取色
-    def sample_env_color(self, ring=8):
-        """取窗口四周一圈的屏幕平均色，当作环境色。取不到返回 None。"""
-        if _user32 is None or _RECT is None:
+    def sample_env_color(self, ring=20):
+        """取窗口四周一圈的屏幕颜色，代表值取偏暗区间。
+
+        四条边各抓一整行/列像素，比逐点 GetPixel 快上百倍。
+        代表值按亮度排序取 30%~55% 分位：只要窗口有相当部分压在深色内容上，
+        整体就会往深色走，不会被浅色那一侧平均掉。
+        """
+        if _grab_line is None or _RECT is None:
             return None
         try:
             hwnd = _user32.GetParent(self.root.winfo_id())
             rc = _RECT()
             if not _user32.GetWindowRect(hwnd, ctypes.byref(rc)):
                 return None
-            scale = self.root.winfo_fpixels('1i') / 96.0   # tk 用逻辑像素，GDI 用物理像素
-            left, top = int(rc.left * scale), int(rc.top * scale)
-            right, bottom = int(rc.right * scale), int(rc.bottom * scale)
-            w, h = max(1, right - left), max(1, bottom - top)
+            left, top, right, bottom = rc.left, rc.top, rc.right, rc.bottom
+            w = max(1, right - left)
+            h = max(1, bottom - top)
 
-            pts = []
-            for i in range(13):
-                x = left + w * i // 12
-                pts.append((x, top - ring))
-                pts.append((x, bottom + ring))
-            for i in range(11):
-                y = top + h * i // 10
-                pts.append((left - ring, y))
-                pts.append((right + ring, y))
+            samples = []
+            step_x = max(1, w // 24)
+            step_y = max(1, h // 20)
+            for y in (top - ring, bottom + ring):
+                if y < 0:
+                    continue
+                row = _grab_line(left, y, w)
+                if row:
+                    samples.extend(row[::step_x])
+            for x in (left - ring, right + ring):
+                if x < 0:
+                    continue
+                col = _grab_line(x, top, h, vertical=True)
+                if col:
+                    samples.extend(col[::step_y])
+            if not samples:
+                return None
 
-            hdc = _user32.GetDC(None)
-            if not hdc:
-                return None
-            acc = [0.0, 0.0, 0.0]
-            n = 0
-            try:
-                for x, y in pts:
-                    if x < 0 or y < 0:
-                        continue
-                    c = _gdi32.GetPixel(hdc, int(x), int(y))
-                    if c == 0xFFFFFFFF:            # CLR_INVALID
-                        continue
-                    acc[0] += c & 0xFF
-                    acc[1] += (c >> 8) & 0xFF
-                    acc[2] += (c >> 16) & 0xFF
-                    n += 1
-            finally:
-                _user32.ReleaseDC(None, hdc)
-            if not n:
-                return None
-            return tuple(v / n for v in acc)
+            samples.sort(key=_luma)
+            lo = int(len(samples) * 0.30)
+            hi = max(lo + 1, int(len(samples) * 0.55))
+            core = samples[lo:hi] or samples
+            return tuple(sum(s[i] for s in core) / len(core) for i in range(3))
         except Exception:
             return None
 
@@ -482,9 +546,24 @@ class Reader:
         if env is None:
             return
         prev = self._last_env
-        if prev and max(abs(a - b) for a, b in zip(env, prev)) < 6:
+        if prev and max(abs(a - b) for a, b in zip(env, prev)) < 10:
             return
         self._apply_theme()
+
+    def _on_root_conf(self, e):
+        """窗口移动/缩放后，等它停下来再重算一次颜色，而不是每帧都算。"""
+        if e.widget is not self.root or self.theme != 'auto':
+            return
+        if self._conf_job is not None:
+            try:
+                self.root.after_cancel(self._conf_job)
+            except Exception:
+                pass
+        self._conf_job = self.root.after(700, self._auto_after_conf)
+
+    def _auto_after_conf(self):
+        self._conf_job = None
+        self._auto_refresh()
 
     # ------------------------------------------------------------------ 配色
     def _apply_theme(self):
@@ -520,7 +599,19 @@ class Reader:
 
         self._tags()
         self.btn_theme.set_text(THEME_NAME[self.theme])
-        self._dark_titlebar(_luma(_rgb(t['bg'])) < 0.5)
+
+        dark = _luma(_rgb(t['bg'])) < 0.5
+        if dark != self._dark_now:          # 这两项都会触发整窗重绘，只在变化时做
+            self._dark_now = dark
+            self._dark_titlebar(dark)
+
+        alpha = 0.93 if self.theme == 'auto' else 1.0
+        if abs(self._alpha_now - alpha) > 0.005:
+            self._alpha_now = alpha
+            try:
+                self.root.attributes('-alpha', alpha)
+            except tk.TclError:
+                pass
 
     def _dark_titlebar(self, dark: bool):
         """Windows 10/11：让标题栏跟随深色配色。"""
@@ -550,7 +641,7 @@ class Reader:
         self.render(keep_ratio=True)
         self.flash('配色 · ' + THEME_NAME[self.theme])
         if self.theme == 'auto':
-            self.flash('配色 · 跟随环境，挪动窗口会重新取色')
+            self.flash('跟随环境 · ' + self._cur['bg'])
 
     def set_fs(self, d):
         self.fs = max(14, min(36, self.fs + d))
@@ -774,7 +865,7 @@ class Reader:
                         self.auto = False
                         self.btn_auto.set_text('自动滚动')
         self._ticks += 1
-        if self.theme == 'auto' and self._ticks % 50 == 0:
+        if self.theme == 'auto' and self._ticks % 100 == 0:   # 5 秒巡一次，够用且不占 CPU
             self._auto_refresh()
         if self._ticks % 100 == 0:      # 每 5 秒落一次盘
             self.save_progress()
@@ -805,6 +896,7 @@ class Reader:
         r.bind('<Control-t>', lambda e: self.cycle_theme())
         r.bind('<Control-b>', lambda e: self.toggle_toc())
         r.protocol('WM_DELETE_WINDOW', self.on_close)
+        r.bind('<Configure>', self._on_root_conf)
 
         self.txt.bind('<Control-MouseWheel>', self._on_ctrl_wheel)
         self.txt.bind('<Button-4>', self._on_ctrl_wheel)

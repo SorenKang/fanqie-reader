@@ -24,3 +24,4 @@ legacy/web/cache/
 *.swp
 Thumbs.db
 .DS_Store
+dark-test.png
