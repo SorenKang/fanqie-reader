@@ -36,7 +36,7 @@
 需要 Python 3.9+（Windows 安装时记得勾选 *Add Python to PATH*）。
 
 ```bash
-git clone https://github.com/<your-name>/fanqie-reader.git
+git clone https://github.com/SorenKang/fanqie-reader.git
 cd fanqie-reader
 python tools/fetch_source.py      # 拉取书源后端，约 11 MB
 ```
